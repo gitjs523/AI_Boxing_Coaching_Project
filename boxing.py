@@ -1,8 +1,8 @@
+from collections import deque
 import math
 import os
 import sys
 import urllib.request
-from collections import deque
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -41,6 +41,23 @@ def calculate_distance(p1, p2):
   return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
 
+def draw_outlined_text(img, text, pos, font, scale, color, thickness):
+  x, y = pos
+  # 동일한 thickness를 유지해 OpenCV 5.0 자간 밀림(글자 겹침) 방지
+  for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+    cv2.putText(
+        img,
+        text,
+        (x + dx, y + dy),
+        font,
+        scale,
+        (0, 0, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+  cv2.putText(img, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+
+
 # ONNX 모델 추론 세션 생성
 session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
 input_info = session.get_inputs()[0]
@@ -48,11 +65,9 @@ input_name = input_info.name
 input_type = input_info.type
 
 # ==========================================
-# [웹캠 연결 (MSMF 스트림 재설정 에러 방지)]
+# [웹캠 연결 (DSHOW 우선 탐색)]
 # ==========================================
 cap = None
-
-# DirectShow 백엔드 우선 탐색
 for idx in [0, 1, 2]:
   temp_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
   if temp_cap.isOpened():
@@ -63,7 +78,6 @@ for idx in [0, 1, 2]:
       break
     temp_cap.release()
 
-# DirectShow 실패 시 기본 백엔드 시도
 if cap is None:
   for idx in [0, 1, 2]:
     temp_cap = cv2.VideoCapture(idx)
@@ -89,9 +103,10 @@ feedback_color = (0, 255, 0)
 # ==========================================
 prev_kpts = None
 alpha = 0.35  # EMA 평활화 계수 (0.1 ~ 0.5)
+ema_enabled = True  # 'f' 키로 필터 ON/OFF 전환
 
-left_wrist_trail = deque(maxlen=12)
-right_wrist_trail = deque(maxlen=12)
+left_wrist_trail = deque(maxlen=14)
+right_wrist_trail = deque(maxlen=14)
 
 while cap.isOpened():
   ret, frame = cap.read()
@@ -113,7 +128,7 @@ while cap.isOpened():
   # [팀원 2 기능 1] 관절 좌표 EMA 저역통과 필터 (떨림 보정)
   # ==========================================
   kpts = raw_kpts.copy()
-  if prev_kpts is not None:
+  if ema_enabled and prev_kpts is not None:
     kpts[:, :2] = alpha * raw_kpts[:, :2] + (1 - alpha) * prev_kpts[:, :2]
   prev_kpts = kpts.copy()
 
@@ -131,6 +146,18 @@ while cap.isOpened():
     l_shoulder, r_shoulder = get_mirror_pt(5), get_mirror_pt(6)
     l_elbow, r_elbow = get_mirror_pt(7), get_mirror_pt(8)
     l_wrist, r_wrist = get_mirror_pt(9), get_mirror_pt(10)
+
+    # 인식 튐(갑작스러운 좌표 점프) 방지 후 궤적 추가
+    if (
+        left_wrist_trail
+        and calculate_distance(left_wrist_trail[-1], l_wrist) > w * 0.25
+    ):
+      left_wrist_trail.clear()
+    if (
+        right_wrist_trail
+        and calculate_distance(right_wrist_trail[-1], r_wrist) > w * 0.25
+    ):
+      right_wrist_trail.clear()
 
     left_wrist_trail.append(tuple(l_wrist))
     right_wrist_trail.append(tuple(r_wrist))
@@ -162,77 +189,164 @@ while cap.isOpened():
           feedback_msg = "Good Stance."
           feedback_color = (0, 255, 0)
 
-      # 관절 스켈레톤 라인 그리기
-      cv2.line(display_frame, l_shoulder, l_elbow, (255, 255, 0), 4)
-      cv2.line(display_frame, l_elbow, l_wrist, (255, 255, 0), 4)
-      cv2.line(display_frame, r_shoulder, r_elbow, feedback_color, 4)
-      cv2.line(display_frame, r_elbow, r_wrist, feedback_color, 4)
-
       # ==========================================
       # [팀원 2 기능 2] 주먹 궤적 잔상 시각화 (Motion Trail)
       # ==========================================
-      # 왼손목 잔상 (민트색)
       for i in range(1, len(left_wrist_trail)):
-        thickness = int(np.sqrt(12 / float(i + 1)) * 3.5)
+        ratio = i / float(len(left_wrist_trail))
+        thickness = max(1, int(ratio * 8))
+        trail_color = (int(255 * ratio), int(255 * ratio), 0)
         cv2.line(
             display_frame,
             left_wrist_trail[i - 1],
             left_wrist_trail[i],
-            (255, 255, 0),
+            trail_color,
             thickness,
+            cv2.LINE_AA,
         )
 
-      # 오른손목 잔상 (주황색)
       for i in range(1, len(right_wrist_trail)):
-        thickness = int(np.sqrt(12 / float(i + 1)) * 3.5)
+        ratio = i / float(len(right_wrist_trail))
+        thickness = max(1, int(ratio * 8))
+        trail_color = (0, int(165 * ratio), int(255 * ratio))
         cv2.line(
             display_frame,
             right_wrist_trail[i - 1],
             right_wrist_trail[i],
-            (0, 165, 255),
+            trail_color,
             thickness,
+            cv2.LINE_AA,
         )
 
-      for pt in [l_shoulder, l_elbow, l_wrist, r_shoulder, r_elbow, r_wrist]:
-        cv2.circle(display_frame, pt, 8, (255, 255, 255), -1)
+      # 관절 스켈레톤 라인 그리기
+      cv2.line(
+          display_frame, l_shoulder, l_elbow, (255, 255, 0), 4, cv2.LINE_AA
+      )
+      cv2.line(display_frame, l_elbow, l_wrist, (255, 255, 0), 4, cv2.LINE_AA)
+      cv2.line(
+          display_frame, r_shoulder, r_elbow, feedback_color, 4, cv2.LINE_AA
+      )
+      cv2.line(display_frame, r_elbow, r_wrist, feedback_color, 4, cv2.LINE_AA)
 
-      cv2.putText(
+      for pt in [l_shoulder, l_elbow, l_wrist, r_shoulder, r_elbow, r_wrist]:
+        cv2.circle(display_frame, pt, 7, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(display_frame, pt, 7, (30, 30, 30), 1, cv2.LINE_AA)
+
+      # 관절 각도 텍스트
+      draw_outlined_text(
           display_frame,
           f"{int(left_arm_angle)} deg",
-          l_elbow,
+          (l_elbow[0] + 12, l_elbow[1] + 5),
           cv2.FONT_HERSHEY_SIMPLEX,
-          0.7,
+          0.6,
           (255, 255, 255),
           2,
       )
+  else:
+    left_wrist_trail.clear()
+    right_wrist_trail.clear()
 
-  # 상단 UI 헤더
-  cv2.rectangle(display_frame, (0, 0), (w, 90), (20, 20, 20), -1)
+  # ==========================================
+  # [반응형 상단 UI 헤더] 해상도/문구 길이에 맞춘 자동 정렬
+  # ==========================================
+  header_h = int(h * 0.13)
+  scale_base = w / 640.0
+  cv2.rectangle(display_frame, (0, 0), (w, header_h), (20, 20, 20), -1)
+
+  # 좌측: JAB COUNT
+  jab_text = f"JAB COUNT: {jab_count}"
+  jab_scale = 0.8 * scale_base
+  jab_thick = max(2, int(2 * scale_base))
+  (jab_w, jab_h), _ = cv2.getTextSize(
+      jab_text, cv2.FONT_HERSHEY_SIMPLEX, jab_scale, jab_thick
+  )
+  jab_x = int(18 * scale_base)
+  jab_y = int((header_h + jab_h) / 2)
   cv2.putText(
       display_frame,
-      f"JAB COUNT: {jab_count}",
-      (30, 55),
+      jab_text,
+      (jab_x, jab_y),
       cv2.FONT_HERSHEY_SIMPLEX,
-      1.3,
+      jab_scale,
       (255, 255, 255),
-      3,
+      jab_thick,
+      cv2.LINE_AA,
   )
+
+  # 우측: 피드백 문구 (남은 가로 폭에 맞춰 크기 자동 축소 및 우측 정렬)
+  margin_x = int(18 * scale_base)
+  gap_x = int(20 * scale_base)
+  max_fb_w = w - (jab_x + jab_w + gap_x) - margin_x
+
+  fb_scale = 0.65 * scale_base
+  fb_thick = max(2, int(2 * scale_base))
+  (fb_w, fb_h), _ = cv2.getTextSize(
+      feedback_msg, cv2.FONT_HERSHEY_SIMPLEX, fb_scale, fb_thick
+  )
+
+  if fb_w > max_fb_w and max_fb_w > 0:
+    fb_scale = fb_scale * (max_fb_w / float(fb_w))
+    (fb_w, fb_h), _ = cv2.getTextSize(
+        feedback_msg, cv2.FONT_HERSHEY_SIMPLEX, fb_scale, fb_thick
+    )
+
+  fb_x = w - fb_w - margin_x
+  fb_y = int((header_h + fb_h) / 2)
   cv2.putText(
       display_frame,
       feedback_msg,
-      (420, 55),
+      (fb_x, fb_y),
       cv2.FONT_HERSHEY_SIMPLEX,
-      1.0,
+      fb_scale,
       feedback_color,
-      3,
+      fb_thick,
+      cv2.LINE_AA,
+  )
+
+  # ==========================================
+  # [하단 좌측 상태 배지] 단일 텍스트 렌더링으로 겹침 방지
+  # ==========================================
+  filter_label = (
+      f"EMA Filter: {'ON' if ema_enabled else 'OFF'} (Press 'f' to toggle)"
+  )
+  filter_color = (0, 255, 200) if ema_enabled else (180, 180, 180)
+  f_scale = 0.52 * scale_base
+  f_thick = max(1, int(1.5 * scale_base))
+  (fw, fh), _ = cv2.getTextSize(
+      filter_label, cv2.FONT_HERSHEY_SIMPLEX, f_scale, f_thick
+  )
+
+  pad_x, pad_y = int(10 * scale_base), int(6 * scale_base)
+  box_x1 = int(12 * scale_base)
+  box_y2 = h - int(10 * scale_base)
+  box_y1 = box_y2 - fh - pad_y * 2
+  box_x2 = box_x1 + fw + pad_x * 2
+
+  cv2.rectangle(
+      display_frame, (box_x1, box_y1), (box_x2, box_y2), (20, 20, 20), -1
+  )
+  cv2.putText(
+      display_frame,
+      filter_label,
+      (box_x1 + pad_x, box_y2 - pad_y),
+      cv2.FONT_HERSHEY_SIMPLEX,
+      f_scale,
+      filter_color,
+      f_thick,
+      cv2.LINE_AA,
   )
 
   cv2.imshow(
       "AI Boxing Coach - DIP Filter & Motion Trail (Press 'q' to quit)",
       display_frame,
   )
-  if cv2.waitKey(1) & 0xFF == ord("q"):
+
+  key = cv2.waitKey(1) & 0xFF
+  if key == ord("q"):
     break
+  elif key == ord("f"):
+    ema_enabled = not ema_enabled
+    prev_kpts = None
 
 cap.release()
 cv2.destroyAllWindows()
