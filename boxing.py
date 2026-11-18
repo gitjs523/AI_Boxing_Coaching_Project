@@ -2,13 +2,14 @@ from collections import deque
 import math
 import os
 import sys
+import time
 import urllib.request
 import cv2
 import numpy as np
 import onnxruntime as ort
 
 # ==========================================
-# [모델 로드 & 초기 설정]
+# [모델 로드 & ONNX CPU 스레드 최적화]
 # ==========================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "movenet_singlepose_lightning_4.onnx")
@@ -43,7 +44,6 @@ def calculate_distance(p1, p2):
 
 def draw_outlined_text(img, text, pos, font, scale, color, thickness):
   x, y = pos
-  # 동일한 thickness를 유지해 OpenCV 5.0 자간 밀림(글자 겹침) 방지
   for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
     cv2.putText(
         img,
@@ -58,8 +58,14 @@ def draw_outlined_text(img, text, pos, font, scale, color, thickness):
   cv2.putText(img, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
-# ONNX 모델 추론 세션 생성
-session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+# CPU 점유율 폭등 방지를 위한 ONNX 스레드 수 제한
+sess_options = ort.SessionOptions()
+sess_options.intra_op_num_threads = 2
+sess_options.inter_op_num_threads = 1
+session = ort.InferenceSession(
+    MODEL_PATH, sess_options=sess_options, providers=["CPUExecutionProvider"]
+)
+
 input_info = session.get_inputs()[0]
 input_name = input_info.name
 input_type = input_info.type
@@ -109,6 +115,8 @@ left_wrist_trail = deque(maxlen=14)
 right_wrist_trail = deque(maxlen=14)
 
 while cap.isOpened():
+  loop_start = time.perf_counter()
+
   ret, frame = cap.read()
   if not ret or frame is None or frame.size == 0:
     continue
@@ -273,7 +281,7 @@ while cap.isOpened():
       cv2.LINE_AA,
   )
 
-  # 우측: 피드백 문구 (남은 가로 폭에 맞춰 크기 자동 축소 및 우측 정렬)
+  # 우측: 피드백 문구
   margin_x = int(18 * scale_base)
   gap_x = int(20 * scale_base)
   max_fb_w = w - (jab_x + jab_w + gap_x) - margin_x
@@ -304,7 +312,7 @@ while cap.isOpened():
   )
 
   # ==========================================
-  # [하단 좌측 상태 배지] 단일 텍스트 렌더링으로 겹침 방지
+  # [하단 좌측 상태 배지]
   # ==========================================
   filter_label = (
       f"EMA Filter: {'ON' if ema_enabled else 'OFF'} (Press 'f' to toggle)"
@@ -341,7 +349,10 @@ while cap.isOpened():
       display_frame,
   )
 
-  key = cv2.waitKey(1) & 0xFF
+  # 웹캠 30 FPS(33ms) 주기에 맞춰 루프 대기 시간 동기화
+  elapsed_ms = (time.perf_counter() - loop_start) * 1000
+  wait_ms = max(1, int(33 - elapsed_ms))
+  key = cv2.waitKey(wait_ms) & 0xFF
   if key == ord("q"):
     break
   elif key == ord("f"):
@@ -350,3 +361,4 @@ while cap.isOpened():
 
 cap.release()
 cv2.destroyAllWindows()
+
