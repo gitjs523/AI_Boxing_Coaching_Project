@@ -106,17 +106,19 @@ feedback_msg = "Ready! Keep your guard up."
 feedback_color = (0, 255, 0)
 
 # ==========================================
-# [신뢰도 가중 적응형 EMA 필터 & 속도 반응형 궤적]
+# [저지연 적응형 EMA 필터 & 스켈레톤 보간 변수]
 # ==========================================
 prev_kpts = None
-vel_ema = np.zeros(17, dtype=np.float32)
 last_valid_kpts = None
 missing_frames = 0
 MAX_MISSING_FRAMES = 5  # 순간적인 인식 누락 시 최대 5프레임(~0.16초) 스켈레톤 유지
 
-ema_enabled = True  # 'f' 키로 필터 ON/OFF 전환
-ALPHA_MIN = 0.12    # 정지/가드 시 강한 노이즈 억제
-ALPHA_MAX = 0.75    # 연속된 빠른 펀치 시 지연 없는 추적
+# 필터 모드: "ADAPTIVE" -> "FIXED" (기존 0.35) -> "OFF"
+FILTER_MODES = ["ADAPTIVE", "FIXED", "OFF"]
+filter_mode_idx = 0
+
+ALPHA_MIN = 0.22  # 정지/가드 시 미세 떨림 억제
+ALPHA_MAX = 0.92  # 펀치 이동 시 지연 없는 즉각 추적
 
 # (x, y, norm_speed) 형태로 저장
 left_wrist_trail = deque(maxlen=14)
@@ -153,37 +155,42 @@ while cap.isOpened():
     raw_kpts = outputs[0, 0]  # (17, 3) -> [y, x, score]
 
     # ==========================================
-    # [기능 1] 신뢰도 가중 1€ 스타일 적응형 EMA 필터
+    # [저지연(Zero-Lag) 적응형 EMA 필터]
     # ==========================================
     kpts = raw_kpts.copy()
-    if ema_enabled and prev_kpts is not None:
+    current_mode = FILTER_MODES[filter_mode_idx]
+
+    if prev_kpts is not None and current_mode != "OFF":
         raw_pos = raw_kpts[:, :2]
         conf = raw_kpts[:, 2]
-        dist = np.linalg.norm(raw_pos - prev_kpts[:, :2], axis=1)
 
-        # 1) 1프레임 만에 화면 12% 이상 순간이동하는 오인식 스파이크 감지
-        is_spike = dist > 0.12
+        if current_mode == "FIXED":
+            kpts[:, :2] = 0.35 * raw_pos + 0.65 * prev_kpts[:, :2]
+        else:
+            dist = np.linalg.norm(raw_pos - prev_kpts[:, :2], axis=1)
 
-        # 2) 이동 속도 자체를 먼저 저역통과 필터링 (단발성 떨림에 alpha 상승 방지)
-        safe_dist = np.where(is_spike, 0.0, dist)
-        vel_ema = 0.4 * safe_dist + 0.6 * vel_ema
+            dynamic_alpha = np.clip(
+                ALPHA_MIN + (dist - 0.004) * ((ALPHA_MAX - ALPHA_MIN) / 0.021),
+                ALPHA_MIN,
+                ALPHA_MAX,
+            )
 
-        # 3) 평활화된 실제 이동 속도에 따라 alpha 산출
-        dynamic_alpha = np.clip(
-            ALPHA_MIN + (vel_ema - 0.004) * ((ALPHA_MAX - ALPHA_MIN) / 0.035),
-            ALPHA_MIN,
-            ALPHA_MAX,
-        )
+            # 정지 상태에서만 낮은 신뢰도 떨림을 억제하고 이동 중에는 추적 속도 유지
+            is_moving = dist >= 0.012
+            rest_conf_weight = np.clip((conf - 0.20) / 0.45, 0.45, 1.0)
+            effective_alpha = np.where(
+                is_moving, dynamic_alpha, dynamic_alpha * rest_conf_weight
+            )
 
-        # 4) 관절 신뢰도(conf) 가중치 적용 및 스파이크 억제
-        conf_weight = np.clip((conf - 0.20) / 0.45, 0.05, 1.0)
-        effective_alpha = dynamic_alpha * conf_weight
-        effective_alpha = np.where(is_spike, 0.05, effective_alpha)
+            # 신뢰도가 매우 낮으면서 화면 28% 이상 순간이동하는 오인식만 억제
+            is_false_jump = (dist > 0.28) & (conf < 0.35)
+            effective_alpha = np.where(is_false_jump, 0.10, effective_alpha)
 
-        kpts[:, :2] = (
-            effective_alpha[:, None] * raw_pos
-            + (1.0 - effective_alpha[:, None]) * prev_kpts[:, :2]
-        )
+            kpts[:, :2] = (
+                effective_alpha[:, None] * raw_pos
+                + (1.0 - effective_alpha[:, None]) * prev_kpts[:, :2]
+            )
+
     prev_kpts = kpts.copy()
 
     display_frame = cv2.flip(frame, 1)
@@ -223,7 +230,7 @@ while cap.isOpened():
                 dist_l = calculate_distance(
                     (left_wrist_trail[-1][0], left_wrist_trail[-1][1]), l_wrist
                 )
-                if dist_l > w * 0.25:
+                if dist_l > w * 0.30:
                     left_wrist_trail.clear()
                 else:
                     l_norm_speed = dist_l / norm_base
@@ -233,7 +240,7 @@ while cap.isOpened():
                 dist_r = calculate_distance(
                     (right_wrist_trail[-1][0], right_wrist_trail[-1][1]), r_wrist
                 )
-                if dist_r > w * 0.25:
+                if dist_r > w * 0.30:
                     right_wrist_trail.clear()
                 else:
                     r_norm_speed = dist_r / norm_base
@@ -269,7 +276,7 @@ while cap.isOpened():
                         feedback_color = (0, 255, 0)
 
             # ==========================================
-            # [기능 2] 속도 반응형 주먹 궤적 잔상
+            # [속도 반응형 주먹 궤적 잔상]
             # ==========================================
             for i in range(1, len(left_wrist_trail)):
                 ratio = i / float(len(left_wrist_trail))
@@ -336,7 +343,6 @@ while cap.isOpened():
         right_wrist_trail.clear()
         if missing_frames > 15:
             prev_kpts = None
-            vel_ema.fill(0.0)
 
     # ==========================================
     # [반응형 상단 UI 헤더]
@@ -396,9 +402,9 @@ while cap.isOpened():
     )
 
     # ==========================================
-    # [하단 좌측: 적응형 EMA 배지 / 우측: FPS & 추론 시간 HUD]
+    # [하단 좌측: 필터 모드 배지 / 우측: FPS & 추론 시간 HUD]
     # ==========================================
-    f_scale = 0.46 * scale_base
+    f_scale = 0.44 * scale_base
     f_thick = max(1, int(1.5 * scale_base))
     pad_x, pad_y = int(10 * scale_base), int(6 * scale_base)
 
@@ -406,10 +412,13 @@ while cap.isOpened():
         filter_label = f"Saved: {saved_filename}"
         filter_color = (0, 255, 120)
     else:
-        filter_label = (
-            f"Adaptive EMA: {'ON' if ema_enabled else 'OFF'} ('f') | Shot ('s')"
-        )
-        filter_color = (0, 255, 200) if ema_enabled else (180, 180, 180)
+        filter_label = f"EMA: {current_mode} ('f') | Reset ('r') | Shot ('s')"
+        if current_mode == "ADAPTIVE":
+            filter_color = (0, 255, 200)
+        elif current_mode == "FIXED":
+            filter_color = (0, 210, 255)
+        else:
+            filter_color = (180, 180, 180)
 
     (fw, fh), _ = cv2.getTextSize(
         filter_label, cv2.FONT_HERSHEY_SIMPLEX, f_scale, f_thick
@@ -464,7 +473,7 @@ while cap.isOpened():
         )
 
     cv2.imshow(
-        "AI Boxing Coach - Adaptive EMA & Motion Trail (Press 'q' to quit)",
+        "AI Boxing Coach ('f': Filter, 'r': Reset, 's': Shot, 'q': Quit)",
         display_frame,
     )
 
@@ -474,9 +483,15 @@ while cap.isOpened():
     if key == ord("q"):
         break
     elif key == ord("f"):
-        ema_enabled = not ema_enabled
+        filter_mode_idx = (filter_mode_idx + 1) % len(FILTER_MODES)
         prev_kpts = None
-        vel_ema.fill(0.0)
+    elif key == ord("r"):
+        jab_count = 0
+        jab_state = "GUARD"
+        left_wrist_trail.clear()
+        right_wrist_trail.clear()
+        feedback_msg = "Reset! Keep your guard up."
+        feedback_color = (0, 255, 0)
     elif key == ord("s"):
         saved_filename = f"capture_{datetime.now().strftime('%H%M%S')}.png"
         save_path = os.path.join(SCRIPT_DIR, saved_filename)
