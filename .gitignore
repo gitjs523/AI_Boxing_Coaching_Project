@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+
+Thumbs.db
+Desktop.ini
+~$*.pptx
+~$*.xlsx
+~$*.docx
+
+관련자료/
