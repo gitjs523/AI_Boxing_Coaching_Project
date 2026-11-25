@@ -64,6 +64,35 @@ def draw_outlined_text(img, text, pos, font, scale, color, thickness):
     cv2.putText(img, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
+def detect_movenet_letterbox(session, input_name, input_type, frame):
+  """16:9 비율 왜곡을 막기 위해 192x192 Letterbox 패딩 후 원본 비율로 역변환합니다."""
+  h, w, _ = frame.shape
+  scale = min(192 / w, 192 / h)
+  nw, nh = int(w * scale), int(h * scale)
+  resized = cv2.resize(frame, (nw, nh))
+
+  canvas = np.zeros((192, 192, 3), dtype=np.uint8)
+  dw, dh = (192 - nw) // 2, (192 - nh) // 2
+  canvas[dh : dh + nh, dw : dw + nw] = resized
+
+  rgb_img = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+  input_tensor = np.expand_dims(
+      rgb_img.astype(np.int32 if "int32" in input_type else np.float32), axis=0
+  )
+
+  outputs = session.run(None, {input_name: input_tensor})[0]
+  raw_kpts = outputs[0, 0]
+
+  real_kpts = np.zeros_like(raw_kpts)
+  for i in range(17):
+    py, px = raw_kpts[i, 0] * 192.0, raw_kpts[i, 1] * 192.0
+    real_kpts[i, 0] = (py - dh) / nh
+    real_kpts[i, 1] = (px - dw) / nw
+    real_kpts[i, 2] = raw_kpts[i, 2]
+  return real_kpts
+
+
+
 # CPU 점유율 폭등 방지를 위한 ONNX 스레드 수 제한
 sess_options = ort.SessionOptions()
 sess_options.intra_op_num_threads = 2
@@ -105,14 +134,20 @@ if cap is None or not cap.isOpened():
     print("\n[카메라 연결 실패] 웹캠 프레임을 읽어올 수 없습니다.")
     sys.exit()
 
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 ui = CoachUI()
 preprocessor = FramePreprocessor()
 game = MittGame()
-stats = SessionStats(version="sim-v2")
+stats = SessionStats(version="sim-test")
 hsv_enabled = False
 clahe_mode = 0
 clahe_active = False
 jab_count = 0
+cross_state = "WAIT_GUARD"
+duck_state = "STAND"
+base_torso_height = 0.0
+prev_hands = {}
 jab_state = "WAIT_GUARD"
 feedback_msg = "가드를 올려 주세요"
 feedback_color = (0, 255, 0)
@@ -163,19 +198,10 @@ while cap.isOpened():
     preprocessor.enabled = clahe_active
     stats.clahe_frames += int(clahe_active)
     frame = preprocessor.apply(frame)
-    # MoveNet 입력 변환: 192x192 RGB
-    img = cv2.resize(frame, (192, 192))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    if "int32" in input_type:
-        input_tensor = np.expand_dims(img.astype(np.int32), axis=0)
-    else:
-        input_tensor = np.expand_dims(img.astype(np.float32), axis=0)
-
     infer_start = time.perf_counter()
-    outputs = session.run(None, {input_name: input_tensor})[0]
+    raw_kpts = detect_movenet_letterbox(session, input_name, input_type, frame)
     infer_ms = (time.perf_counter() - infer_start) * 1000.0
     stats.infer_total += infer_ms
-    raw_kpts = outputs[0, 0]  # (17, 3) -> [y, x, score]
 
     # ==========================================
     # [저지연(Zero-Lag) 적응형 EMA 필터]
@@ -219,23 +245,27 @@ while cap.isOpened():
     display_frame = cv2.flip(frame, 1)
     h, w, _ = display_frame.shape
 
-    required_indices = [0, 5, 6, 7, 8, 9, 10]
-    is_detected = all(kpts[i][2] > 0.25 for i in required_indices)
-
-    if is_detected:
+    # Team threshold; only current observations qualify for scoring.
+    core_visible = kpts[0,2] > .30 and all(kpts[i,2] > .20 for i in (5,6))
+    fresh = {side: bool(core_visible and all(kpts[i,2] > .08 for i in ids))
+             for side,ids in [('left',(7,9)),('right',(8,10))]}
+    is_detected = core_visible and all(fresh.values())
+    if core_visible:
         missing_frames = 0
-        last_valid_kpts = kpts.copy()
-        active_kpts = kpts
+        active_kpts = kpts.copy()
+        if last_valid_kpts is not None:
+            for i in (7,8,9,10):
+                if kpts[i,2] <= .08: active_kpts[i] = last_valid_kpts[i]
+        if is_detected: last_valid_kpts = kpts.copy()
     else:
         missing_frames += 1
-        active_kpts = (
-            last_valid_kpts if missing_frames <= MAX_MISSING_FRAMES else None
-        )
+        active_kpts = last_valid_kpts if missing_frames <= MAX_MISSING_FRAMES else None
 
     hands = {"left": None, "right": None}
     angles = {}
     shoulder_width = 0
     valid_pose = False
+    extended = {}
     if active_kpts is not None:
 
         def get_mirror_pt(idx):
@@ -280,48 +310,67 @@ while cap.isOpened():
             r_guard_dist = calculate_distance(r_wrist, nose) / shoulder_width
             is_r_hand_low = r_wrist[1] > r_shoulder[1]
 
+            right_arm_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
+            torso_height = (l_shoulder[1]+r_shoulder[1])/2-nose[1]
+            if core_visible and torso_height > 35 and duck_state == "STAND":
+                base_torso_height = (.95*base_torso_height+.05*torso_height) if base_torso_height else torso_height
+            ref_height = max(base_torso_height, torso_height, 40.)
+            points = {"left": l_wrist, "right": r_wrist}
+            shoulders = {"left": l_shoulder, "right": r_shoulder}
+            arm_angles = {"left": left_arm_angle, "right": right_arm_angle}
+            extended = {}
+            guard = {}
+            for side in ("left", "right"):
+                if not fresh[side]:
+                    prev_hands.pop(side,None)
+                    continue
+                hand = points[side]
+                angle = arm_angles[side]
+                reach = calculate_distance(shoulders[side],hand)/ref_height
+                velocity = calculate_distance(hand,prev_hands[side])/ref_height if side in prev_hands else 0.
+                prev_hands[side] = hand.copy()
+                extended[side] = angle > 125 or (angle > 110 and reach > 1.65) or (velocity > .55 and angle > 105 and reach > 1.45)
+                guard[side] = calculate_distance(hand,nose)/ref_height <= 1.8 and hand[1] <= shoulders[side][1]
+                hands[side] = hand
+                angles[side] = angle
+            valid_pose = any(fresh.values())
             if is_detected:
-                valid_pose = True
                 stats.detected_frames += 1
-                right_arm_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
-                angles = {"left": left_arm_angle, "right": right_arm_angle}
-                guard_bad = r_guard_dist > 1.4 or is_r_hand_low
-                if left_arm_angle < 95 and right_arm_angle < 110:
+                if not any(extended.values()):
                     stats.guard_samples += 1
-                    stats.good_guard += int(not guard_bad and l_wrist[1] <= l_shoulder[1] and calculate_distance(l_wrist, nose)/shoulder_width <= 1.4)
-                hands = {"left": l_wrist, "right": r_wrist}
-                if hsv_enabled:
-                    gloves = detect_gloves(display_frame, l_wrist, r_wrist, shoulder_width)
-                    for side, color in [("left", (255,0,0)), ("right", (0,0,255))]:
-                        center = gloves[side]
-                        if center is not None:
-                            if side == "left": stats.hsv_left_frames += 1
-                            else: stats.hsv_right_frames += 1
-                            hands[side] = fuse_wrist(hands[side], center, shoulder_width)
-                            cv2.circle(display_frame, center, 9, color, 2)
-                if r_guard_dist > 1.4 or is_r_hand_low:
-                    stats.warnings += 1
-                if left_arm_angle > 155:
-                    if jab_state == "GUARD":
-                        jab_count += 1
-                        stats.good_jabs += int(not guard_bad)
-                        jab_state = "EXTENDED"
-
-                    if r_guard_dist > 1.4 or is_r_hand_low:
-                        feedback_msg = "오른손 가드를 올리세요"
-                        feedback_color = (0, 0, 255)
-                    else:
-                        feedback_msg = "좋은 잽! 가드 유지"
-                        feedback_color = (0, 255, 0)
-
-                elif left_arm_angle < 95:
-                    jab_state = "GUARD"
-                    if (l_wrist[1] > l_shoulder[1]) or is_r_hand_low:
-                        feedback_msg = "양손으로 턱을 보호하세요"
-                        feedback_color = (0, 165, 255)
-                    else:
-                        feedback_msg = "좋은 가드 자세"
-                        feedback_color = (0, 255, 0)
+                    stats.good_guard += int(all(guard.values()))
+                stats.warnings += int(not all(guard.values()))
+            for side in ("left", "right"):
+                state = jab_state if side == "left" else cross_state
+                other = "right" if side == "left" else "left"
+                if not fresh[side]: state = "WAIT_GUARD"
+                elif extended[side] and state == "GUARD":
+                    state = "EXTENDED"
+                    if side == "left": jab_count += 1
+                    else: stats.cross_count += 1
+                    if other in guard:
+                        stats.evaluated_punches += 1
+                        stats.good_punches += int(guard[other])
+                        if side == "left": stats.good_jabs += int(guard[other])
+                    feedback_msg = ("좋은 잽!" if side == "left" else "좋은 스트레이트!") if guard.get(other) else "반대 손 가드 확인"
+                elif arm_angles[side] < 115 and calculate_distance(shoulders[side],points[side])/ref_height < 1.55:
+                    state = "GUARD"
+                if side == "left": jab_state = state
+                else: cross_state = state
+            if core_visible and base_torso_height > 0:
+                ratio = torso_height/max(base_torso_height,40.)
+                if ratio < .68 and duck_state == "STAND":
+                    duck_state = "DUCKED"; stats.duck_count += 1
+                elif ratio > .82: duck_state = "STAND"
+            if hsv_enabled and valid_pose:
+                gloves = detect_gloves(display_frame, hands['left'], hands['right'], shoulder_width)
+                for side,color in [('left',(255,0,0)),('right',(0,0,255))]:
+                    if hands[side] is not None and gloves[side] is not None:
+                        if side == 'left': stats.hsv_left_frames += 1
+                        else: stats.hsv_right_frames += 1
+                        hands[side] = fuse_wrist(hands[side],gloves[side],shoulder_width)
+                        cv2.circle(display_frame,gloves[side],9,color,2)
+            feedback_color = (0,255,0) if valid_pose else (0,165,255)
 
             # ==========================================
             # [속도 반응형 주먹 궤적 잔상]
@@ -394,8 +443,9 @@ while cap.isOpened():
 
     # Game only uses freshly observed pose, never a held skeleton.
     if not valid_pose:
-        if missing_frames > MAX_MISSING_FRAMES: jab_state = "WAIT_GUARD"
-    game.update(display_frame.shape, hands, angles, shoulder_width)
+        jab_state = cross_state = "WAIT_GUARD"
+        prev_hands.clear()
+    game.update(display_frame.shape, hands, angles, shoulder_width, extended=extended)
     game.draw(display_frame)
     stats.jab_count = jab_count
     stats.sync_game(game)
@@ -427,8 +477,12 @@ while cap.isOpened():
         prev_kpts = None
     elif key == ord("r"):
         jab_count = 0
+        cross_state = "WAIT_GUARD"
+        duck_state = "STAND"
+        base_torso_height = 0.0
+        prev_hands.clear()
         game = MittGame()
-        stats = SessionStats(version="sim-v2")
+        stats = SessionStats(version="sim-test")
         jab_state = "WAIT_GUARD"
         left_wrist_trail.clear()
         right_wrist_trail.clear()

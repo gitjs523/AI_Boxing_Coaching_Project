@@ -75,7 +75,7 @@ class CoachUI:
         rect(img,px,85,pw,125);rect(img,px,85,5,125,RED)
         txt(img,'훈련 피드백',px+18,98,19,MUTED,True)
         txt(img,feedback if detected else '관절 인식 대기 중',px+18,135,26,WHITE,True)
-        txt(img,'잽 횟수   '+str(stats.jab_count),px+18,176,21,GOLD,True)
+        txt(img,f'잽 {stats.jab_count}  직선 {stats.cross_count}  회피 {stats.duck_count}',px+18,176,21,GOLD,True)
         rect(img,px,222,pw,212);txt(img,'가상 미트  /  60초 라운드',px+18,235,21,MUTED,True)
         txt(img,f'{game.score:,}',px+18,273,53,WHITE,True);txt(img,'점',px+220,298,23,MUTED)
         txt(img,f'콤보 {game.combo}   최고 {game.max_combo}',px+18,336,24,GOLD,True)
@@ -83,7 +83,7 @@ class CoachUI:
         txt(img,('남은 시간 '+str(int(np.ceil(game.remaining)))+'초') if game.enabled else ('라운드 종료' if game.finished else 'G 키로 훈련 시작'),px+18,403,18,MUTED)
         rect(img,px,446,pw,126);txt(img,'자세 평가  /  규칙 기반',px+18,459,19,MUTED,True)
         score,grade=stats.evaluate();txt(img,grade,px+18,492,43,GREEN if score is not None else MUTED,True)
-        txt(img,f'{score:.1f} / 100' if score is not None else '잽 5회 이상 필요',px+160,509,21,WHITE)
+        txt(img,f'{score:.1f} / 100' if score is not None else '펀치 5회 이상 필요',px+160,509,21,WHITE)
         guard=100*stats.good_guard/stats.guard_samples if stats.guard_samples else 0
         txt(img,f'가드 유지율 {guard:.0f}%' if stats.guard_samples else '가드 평가 대기',px+18,547,18,MUTED)
         rect(img,px,584,pw,101);txt(img,'시스템 성능',px+18,597,18,MUTED,True)
@@ -102,7 +102,7 @@ class CoachUI:
         return img
     def summary(self,stats,paths):
         img=np.full((H,W,3),BG,np.uint8);rect(img,0,0,W,7,RED);txt(img,'훈련 종료  /  최종 리포트',48,45,44,WHITE,True)
-        d=stats.to_dict(); score,grade=stats.evaluate();rect(img,48,125,400,400,PANEL);txt(img,'자세 평가 등급',80,150,27,MUTED,True);txt(img,grade,80,225,85,GREEN if score is not None else GOLD,True);txt(img,f'{score:.1f} / 100' if score is not None else '평가 표본 부족',80,350,30,WHITE,True);txt(img,'잽 자세 70% + 가드 유지 30%',80,435,21,MUTED)
+        d=stats.to_dict(); score,grade=stats.evaluate();rect(img,48,125,400,400,PANEL);txt(img,'자세 평가 등급',80,150,27,MUTED,True);txt(img,grade,80,225,85,GREEN if score is not None else GOLD,True);txt(img,f'{score:.1f} / 100' if score is not None else '평가 표본 부족',80,350,30,WHITE,True);txt(img,'펀치 가드 70% + 기본 가드 30%',80,435,21,MUTED)
         for i,(label,value) in enumerate([('잽 횟수',d['jab_count']),('가드 유지율',d['guard_rate_percent']),('미트 점수',d['mitt_score']),('미트 명중률',d['mitt_accuracy_percent']),('최고 콤보',d['max_combo']),('관절 인식률',d['pose_detection_rate_percent'])]):
             x=470+(i%2)*465;y=125+(i//2)*135;rect(img,x,y,445,120,PANEL);txt(img,label,x+20,y+15,23,MUTED,True);txt(img,('—' if value is None else str(value)+('%' if '율' in label else '')),x+20,y+54,38,WHITE,True)
         txt(img,'CSV / JSON 저장 완료' if paths else '리포트 저장 실패 — 콘솔 확인',48,565,28,GREEN if paths else RED,True)
