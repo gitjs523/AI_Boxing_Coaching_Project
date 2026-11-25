@@ -8,6 +8,11 @@ import urllib.request
 import cv2
 import numpy as np
 import onnxruntime as ort
+from preprocessing import FramePreprocessor
+from mitt_game import MittGame
+from report import SessionStats
+from glove_detector import detect_gloves, fuse_wrist
+from ui import CoachUI
 
 # ==========================================
 # [모델 로드 & ONNX CPU 스레드 최적화]
@@ -100,9 +105,16 @@ if cap is None or not cap.isOpened():
     print("\n[카메라 연결 실패] 웹캠 프레임을 읽어올 수 없습니다.")
     sys.exit()
 
+ui = CoachUI()
+preprocessor = FramePreprocessor()
+game = MittGame()
+stats = SessionStats(version="sim-v2")
+hsv_enabled = False
+clahe_mode = 0
+clahe_active = False
 jab_count = 0
-jab_state = "GUARD"
-feedback_msg = "Ready! Keep your guard up."
+jab_state = "WAIT_GUARD"
+feedback_msg = "가드를 올려 주세요"
 feedback_color = (0, 255, 0)
 
 # ==========================================
@@ -139,8 +151,18 @@ while cap.isOpened():
 
     ret, frame = cap.read()
     if not ret or frame is None or frame.size == 0:
-        continue
+        print("웹캠 프레임 읽기 실패")
+        break
 
+    stats.frames += 1
+    if clahe_mode == 2:
+        brightness = cv2.cvtColor(cv2.resize(frame, (80, 60)), cv2.COLOR_BGR2GRAY).mean()
+        clahe_active = brightness < (95 if clahe_active else 75)
+    else:
+        clahe_active = clahe_mode == 1
+    preprocessor.enabled = clahe_active
+    stats.clahe_frames += int(clahe_active)
+    frame = preprocessor.apply(frame)
     # MoveNet 입력 변환: 192x192 RGB
     img = cv2.resize(frame, (192, 192))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -152,6 +174,7 @@ while cap.isOpened():
     infer_start = time.perf_counter()
     outputs = session.run(None, {input_name: input_tensor})[0]
     infer_ms = (time.perf_counter() - infer_start) * 1000.0
+    stats.infer_total += infer_ms
     raw_kpts = outputs[0, 0]  # (17, 3) -> [y, x, score]
 
     # ==========================================
@@ -209,6 +232,10 @@ while cap.isOpened():
             last_valid_kpts if missing_frames <= MAX_MISSING_FRAMES else None
         )
 
+    hands = {"left": None, "right": None}
+    angles = {}
+    shoulder_width = 0
+    valid_pose = False
     if active_kpts is not None:
 
         def get_mirror_pt(idx):
@@ -254,25 +281,46 @@ while cap.isOpened():
             is_r_hand_low = r_wrist[1] > r_shoulder[1]
 
             if is_detected:
+                valid_pose = True
+                stats.detected_frames += 1
+                right_arm_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
+                angles = {"left": left_arm_angle, "right": right_arm_angle}
+                guard_bad = r_guard_dist > 1.4 or is_r_hand_low
+                if left_arm_angle < 95 and right_arm_angle < 110:
+                    stats.guard_samples += 1
+                    stats.good_guard += int(not guard_bad and l_wrist[1] <= l_shoulder[1] and calculate_distance(l_wrist, nose)/shoulder_width <= 1.4)
+                hands = {"left": l_wrist, "right": r_wrist}
+                if hsv_enabled:
+                    gloves = detect_gloves(display_frame, l_wrist, r_wrist, shoulder_width)
+                    for side, color in [("left", (255,0,0)), ("right", (0,0,255))]:
+                        center = gloves[side]
+                        if center is not None:
+                            if side == "left": stats.hsv_left_frames += 1
+                            else: stats.hsv_right_frames += 1
+                            hands[side] = fuse_wrist(hands[side], center, shoulder_width)
+                            cv2.circle(display_frame, center, 9, color, 2)
+                if r_guard_dist > 1.4 or is_r_hand_low:
+                    stats.warnings += 1
                 if left_arm_angle > 155:
                     if jab_state == "GUARD":
                         jab_count += 1
+                        stats.good_jabs += int(not guard_bad)
                         jab_state = "EXTENDED"
 
                     if r_guard_dist > 1.4 or is_r_hand_low:
-                        feedback_msg = "WARNING: Keep your RIGHT hand up!"
+                        feedback_msg = "오른손 가드를 올리세요"
                         feedback_color = (0, 0, 255)
                     else:
-                        feedback_msg = "GOOD JAB! Nice guard."
+                        feedback_msg = "좋은 잽! 가드 유지"
                         feedback_color = (0, 255, 0)
 
                 elif left_arm_angle < 95:
                     jab_state = "GUARD"
                     if (l_wrist[1] > l_shoulder[1]) or is_r_hand_low:
-                        feedback_msg = "Hands up! Protect your chin."
+                        feedback_msg = "양손으로 턱을 보호하세요"
                         feedback_color = (0, 165, 255)
                     else:
-                        feedback_msg = "Good Stance."
+                        feedback_msg = "좋은 가드 자세"
                         feedback_color = (0, 255, 0)
 
             # ==========================================
@@ -344,162 +392,71 @@ while cap.isOpened():
         if missing_frames > 15:
             prev_kpts = None
 
-    # ==========================================
-    # [반응형 상단 UI 헤더]
-    # ==========================================
-    header_h = int(h * 0.13)
-    scale_base = w / 640.0
-    cv2.rectangle(display_frame, (0, 0), (w, header_h), (20, 20, 20), -1)
-
-    # 좌측: JAB COUNT
-    jab_text = f"JAB COUNT: {jab_count}"
-    jab_scale = 0.8 * scale_base
-    jab_thick = max(2, int(2 * scale_base))
-    (jab_w, jab_h), _ = cv2.getTextSize(
-        jab_text, cv2.FONT_HERSHEY_SIMPLEX, jab_scale, jab_thick
-    )
-    jab_x = int(18 * scale_base)
-    jab_y = int((header_h + jab_h) / 2)
-    cv2.putText(
-        display_frame,
-        jab_text,
-        (jab_x, jab_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        jab_scale,
-        (255, 255, 255),
-        jab_thick,
-        cv2.LINE_AA,
-    )
-
-    # 우측: 피드백 문구
-    margin_x = int(18 * scale_base)
-    gap_x = int(20 * scale_base)
-    max_fb_w = w - (jab_x + jab_w + gap_x) - margin_x
-
-    fb_scale = 0.65 * scale_base
-    fb_thick = max(2, int(2 * scale_base))
-    (fb_w, fb_h), _ = cv2.getTextSize(
-        feedback_msg, cv2.FONT_HERSHEY_SIMPLEX, fb_scale, fb_thick
-    )
-
-    if fb_w > max_fb_w and max_fb_w > 0:
-        fb_scale = fb_scale * (max_fb_w / float(fb_w))
-        (fb_w, fb_h), _ = cv2.getTextSize(
-            feedback_msg, cv2.FONT_HERSHEY_SIMPLEX, fb_scale, fb_thick
-        )
-
-    fb_x = w - fb_w - margin_x
-    fb_y = int((header_h + fb_h) / 2)
-    cv2.putText(
-        display_frame,
-        feedback_msg,
-        (fb_x, fb_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        fb_scale,
-        feedback_color,
-        fb_thick,
-        cv2.LINE_AA,
-    )
-
-    # ==========================================
-    # [하단 좌측: 필터 모드 배지 / 우측: FPS & 추론 시간 HUD]
-    # ==========================================
-    f_scale = 0.44 * scale_base
-    f_thick = max(1, int(1.5 * scale_base))
-    pad_x, pad_y = int(10 * scale_base), int(6 * scale_base)
-
-    if time.perf_counter() < saved_notice_until:
-        filter_label = f"Saved: {saved_filename}"
-        filter_color = (0, 255, 120)
-    else:
-        filter_label = f"EMA: {current_mode} ('f') | Reset ('r') | Shot ('s')"
-        if current_mode == "ADAPTIVE":
-            filter_color = (0, 255, 200)
-        elif current_mode == "FIXED":
-            filter_color = (0, 210, 255)
-        else:
-            filter_color = (180, 180, 180)
-
-    (fw, fh), _ = cv2.getTextSize(
-        filter_label, cv2.FONT_HERSHEY_SIMPLEX, f_scale, f_thick
-    )
-
-    l_box_x1 = int(12 * scale_base)
-    l_box_y2 = h - int(10 * scale_base)
-    l_box_y1 = l_box_y2 - fh - pad_y * 2
-    l_box_x2 = l_box_x1 + fw + pad_x * 2
-
-    cv2.rectangle(
-        display_frame, (l_box_x1, l_box_y1), (l_box_x2, l_box_y2), (20, 20, 20), -1
-    )
-    cv2.putText(
-        display_frame,
-        filter_label,
-        (l_box_x1 + pad_x, l_box_y2 - pad_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        f_scale,
-        filter_color,
-        f_thick,
-        cv2.LINE_AA,
-    )
-
-    perf_label = f"FPS: {fps_ema:.1f} | Infer: {infer_ms:.1f}ms"
-    (pw, ph), _ = cv2.getTextSize(
-        perf_label, cv2.FONT_HERSHEY_SIMPLEX, f_scale, f_thick
-    )
-
-    r_box_x2 = w - int(12 * scale_base)
-    r_box_x1 = r_box_x2 - pw - pad_x * 2
-    r_box_y2 = l_box_y2
-    r_box_y1 = r_box_y2 - ph - pad_y * 2
-
-    if r_box_x1 > l_box_x2 + int(8 * scale_base):
-        cv2.rectangle(
-            display_frame,
-            (r_box_x1, r_box_y1),
-            (r_box_x2, r_box_y2),
-            (20, 20, 20),
-            -1,
-        )
-        cv2.putText(
-            display_frame,
-            perf_label,
-            (r_box_x1 + pad_x, r_box_y2 - pad_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            f_scale,
-            (220, 220, 220),
-            f_thick,
-            cv2.LINE_AA,
-        )
-
-    cv2.imshow(
-        "AI Boxing Coach ('f': Filter, 'r': Reset, 's': Shot, 'q': Quit)",
-        display_frame,
-    )
+    # Game only uses freshly observed pose, never a held skeleton.
+    if not valid_pose:
+        if missing_frames > MAX_MISSING_FRAMES: jab_state = "WAIT_GUARD"
+    game.update(display_frame.shape, hands, angles, shoulder_width)
+    game.draw(display_frame)
+    stats.jab_count = jab_count
+    stats.sync_game(game)
+    screen = ui.render(display_frame, stats, game, feedback_msg, valid_pose,
+                       clahe_mode, clahe_active, hsv_enabled, current_mode, fps_ema, infer_ms)
+    ui.present(screen)
 
     elapsed_ms = (time.perf_counter() - loop_start) * 1000
     wait_ms = max(1, int(33 - elapsed_ms))
     key = cv2.waitKey(wait_ms) & 0xFF
-    if key == ord("q"):
+    try:
+        if cv2.getWindowProperty(ui.window, cv2.WND_PROP_VISIBLE) < 1: break
+    except cv2.error:
         break
+    if key in (ord("?"), ord("/")):
+        ui.help = not ui.help
+    elif key == ord("q"):
+        break
+    elif key == ord("c"):
+        clahe_mode = (clahe_mode + 1) % 3
+    elif key == ord("g"):
+        game.toggle()
+    elif key == ord("h"):
+        hsv_enabled = not hsv_enabled
+    elif key == ord("p"):
+        print("리포트 저장:", stats.save(os.path.join(SCRIPT_DIR, "reports")))
     elif key == ord("f"):
         filter_mode_idx = (filter_mode_idx + 1) % len(FILTER_MODES)
         prev_kpts = None
     elif key == ord("r"):
         jab_count = 0
-        jab_state = "GUARD"
+        game = MittGame()
+        stats = SessionStats(version="sim-v2")
+        jab_state = "WAIT_GUARD"
         left_wrist_trail.clear()
         right_wrist_trail.clear()
-        feedback_msg = "Reset! Keep your guard up."
+        feedback_msg = "기록 초기화 완료"
         feedback_color = (0, 255, 0)
     elif key == ord("s"):
         saved_filename = f"capture_{datetime.now().strftime('%H%M%S')}.png"
         save_path = os.path.join(SCRIPT_DIR, saved_filename)
-        is_ok, buf = cv2.imencode(".png", display_frame)
+        is_ok, buf = cv2.imencode(".png", screen)
         if is_ok:
             buf.tofile(save_path)
             saved_notice_until = time.perf_counter() + 1.5
             print(f"스크린샷 저장 완료: {save_path}")
 
 cap.release()
-cv2.destroyAllWindows()
+paths = None
+try:
+    paths = stats.save(os.path.join(SCRIPT_DIR, "reports"))
+    print("최종 리포트 저장:", paths)
+    print(stats.to_dict())
+except OSError as e:
+    print("리포트 저장 오류:", e)
+try:
+    if cv2.getWindowProperty(ui.window, cv2.WND_PROP_VISIBLE) >= 1:
+        ui.summary(stats, paths)
+        while cv2.waitKey(50) < 0:
+            if cv2.getWindowProperty(ui.window, cv2.WND_PROP_VISIBLE) < 1: break
+except cv2.error:
+    pass
+finally:
+    cv2.destroyAllWindows()
